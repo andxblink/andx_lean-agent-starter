@@ -1,0 +1,4 @@
+interface:
+  display_name: "Continuity"
+  short_description: "Lean cross-agent project continuity"
+  default_prompt: "Use $continuity to keep this work resumable and audit its memory footprint."

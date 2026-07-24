@@ -1,0 +1,44 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run ShellCheck
+        run: |
+          shellcheck \
+            install.sh \
+            bin/andx-continuity \
+            bin/andx-project \
+            skills/continuity/scripts/continuity-state.sh \
+            tests/*.sh \
+            tests/fixtures/*.sh
+  integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check Bash syntax
+        run: |
+          bash -n \
+            install.sh \
+            bin/andx-continuity \
+            bin/andx-project \
+            skills/continuity/scripts/continuity-state.sh \
+            tests/*.sh \
+            tests/fixtures/*.sh
+      - name: Run integration tests
+        run: bash tests/run.sh
