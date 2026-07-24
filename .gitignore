@@ -1,0 +1,14 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials*.json
+
+# Agent state and disposable work
+.agent/
+temp/
+
+# Local operating-system state
+.DS_Store

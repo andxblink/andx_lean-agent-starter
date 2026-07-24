@@ -1,0 +1,543 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  andx-project init PATH [--purpose TEXT] [--dry-run]
+  andx-project adopt PATH [--purpose TEXT] [--dry-run]
+
+init creates the minimal andx project envelope and an independent local Git
+repository in a missing or empty directory. It does not configure a remote.
+adopt brings an existing directory up to the same envelope by creating missing
+directories and missing files only: it never overwrites, merges, or deletes an
+existing file, and it reports every conflict with the exact path and a
+suggested manual resolution.
+
+Options:
+  --purpose TEXT  Put a one-line purpose in README.md.
+  --dry-run       Validate and show the complete proposed-change report
+                  without creating anything.
+  --version       Print the starter version.
+  -h, --help      Show this help.
+
+adopt exits 0 when the envelope is complete without conflicts and 3 when
+manual resolutions remain. Start and Verify commands are never guessed from
+an existing repository; generated files keep explicit placeholders.
+EOF
+}
+
+die() {
+  printf 'andx-project: %s\n' "$*" >&2
+  exit 1
+}
+
+resolve_script_dir() {
+  local source_path="${BASH_SOURCE[0]}"
+  local source_dir
+
+  while [[ -L "$source_path" ]]; do
+    source_dir="$(cd -P "$(dirname "$source_path")" && pwd)"
+    source_path="$(readlink "$source_path")"
+    if [[ "$source_path" != /* ]]; then
+      source_path="$source_dir/$source_path"
+    fi
+  done
+
+  cd -P "$(dirname "$source_path")" && pwd
+}
+
+render_readme() {
+  local template_path="$1"
+  local output_path="$2"
+  local project_name="$3"
+  local project_purpose="$4"
+  local line
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      '{{PROJECT_TITLE}}')
+        printf '# %s\n' "$project_name"
+        ;;
+      '{{PROJECT_PURPOSE}}')
+        printf '%s\n' "$project_purpose"
+        ;;
+      *)
+        printf '%s\n' "$line"
+        ;;
+    esac
+  done < "$template_path" > "$output_path"
+}
+
+target_is_empty_directory() {
+  local target_path="$1"
+  [[ -d "$target_path" ]] &&
+    [[ -z "$(find "$target_path" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+}
+
+print_tree() {
+  cat <<'EOF'
+  README.md
+  AGENTS.md
+  CLAUDE.md
+  GEMINI.md
+  .gitignore
+  .andx-starter
+  docs/
+  planning/
+  handoffs/
+  scripts/
+  swarms/
+  temp/
+  .agent/
+EOF
+}
+
+read_starter_version() {
+  local version_file="$repo_root/VERSION"
+  [[ -f "$version_file" ]] || die "missing version marker: $version_file"
+  head -n 1 "$version_file"
+}
+
+directory_is_empty() {
+  [[ -z "$(find "$1" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+}
+
+plan_actions=()
+plan_action_count=0
+conflict_reports=()
+conflict_count=0
+create_list=()
+create_count=0
+adopt_temp_path=""
+
+add_action() {
+  plan_actions[plan_action_count]="$1"
+  plan_action_count=$((plan_action_count + 1))
+}
+
+add_create() {
+  add_action "create $1"
+  create_list[create_count]="$1"
+  create_count=$((create_count + 1))
+}
+
+add_conflict() {
+  conflict_reports[conflict_count]="$1"
+  conflict_count=$((conflict_count + 1))
+}
+
+# Trailing slash marks a directory entry throughout the adoption plan.
+classify_directory() {
+  local rel="$1"
+  local path="$target_path/$rel"
+
+  if [[ -L "$path" ]]; then
+    add_conflict "$rel: is a symlink; replace it with a real directory manually"
+  elif [[ -d "$path" ]]; then
+    add_action "keep   $rel/"
+  elif [[ -e "$path" ]]; then
+    add_conflict "$rel: exists and is not a directory; move it aside manually"
+  else
+    add_create "$rel/"
+  fi
+}
+
+classify_gitkeep() {
+  local rel="$1"
+  local dir_path="$target_path/$rel"
+
+  if [[ -L "$dir_path" ]]; then
+    return 0
+  fi
+  if [[ -d "$dir_path" ]]; then
+    if directory_is_empty "$dir_path" && [[ ! -e "$dir_path/.gitkeep" ]]; then
+      add_create "$rel/.gitkeep"
+    fi
+  elif [[ ! -e "$dir_path" ]]; then
+    add_create "$rel/.gitkeep"
+  fi
+}
+
+inspect_kept_file() {
+  local rel="$1"
+  local path="$target_path/$rel"
+
+  case "$rel" in
+    .gitignore)
+      grep -E -q '^\.agent/?$' "$path" ||
+        add_conflict ".gitignore: add a '.agent/' line so continuity state stays ignored"
+      grep -E -q '^temp/?$' "$path" ||
+        add_conflict ".gitignore: add a 'temp/' line so disposable work stays ignored"
+      ;;
+    CLAUDE.md|GEMINI.md)
+      grep -F -q 'AGENTS.md' "$path" ||
+        add_conflict "$rel: point this adapter at AGENTS.md as the canonical rules"
+      ;;
+  esac
+}
+
+classify_file() {
+  local rel="$1"
+  local path="$target_path/$rel"
+
+  if [[ -L "$path" ]]; then
+    add_conflict "$rel: is a symlink; replace it with a regular file manually"
+  elif [[ -f "$path" ]]; then
+    add_action "keep   $rel"
+    inspect_kept_file "$rel"
+  elif [[ -e "$path" ]]; then
+    add_conflict "$rel: exists and is not a regular file; move it aside manually"
+  else
+    add_create "$rel"
+  fi
+}
+
+render_adopt_file() {
+  local rel="$1"
+  local out="$2"
+
+  case "$rel" in
+    README.md)
+      render_readme "$readme_template" "$out" "$project_name" "$purpose"
+      ;;
+    AGENTS.md)
+      cp "$agents_template" "$out"
+      ;;
+    CLAUDE.md)
+      cp "$claude_template" "$out"
+      ;;
+    GEMINI.md)
+      cp "$gemini_template" "$out"
+      ;;
+    .gitignore)
+      cp "$gitignore_template" "$out"
+      ;;
+    .andx-starter)
+      printf 'starter_version=%s\n' "$starter_version" > "$out"
+      ;;
+    */.gitkeep)
+      : > "$out"
+      ;;
+    *)
+      die "unknown adopt artifact: $rel"
+      ;;
+  esac
+}
+
+cleanup_adopt() {
+  if [[ -n "${adopt_temp_path:-}" && -e "$adopt_temp_path" ]]; then
+    rm -f "$adopt_temp_path"
+  fi
+}
+
+# Creation never overwrites: directories via bare mkdir, files via a hard
+# link from a staged temporary, both of which fail if the path appeared
+# concurrently. A concurrent appearance is reported and left untouched.
+adopt_create_path() {
+  local rel="$1"
+  local path="$target_path/${rel%/}"
+
+  if [[ "$rel" == */ ]]; then
+    if ! mkdir "$path" 2>/dev/null; then
+      [[ -d "$path" && ! -L "$path" ]] ||
+        die "could not create directory: $path"
+      printf 'Skipped (appeared concurrently): %s\n' "$rel"
+    fi
+    return 0
+  fi
+
+  adopt_temp_path="$(mktemp "$target_path/.andx-adopt.XXXXXX")" ||
+    die "could not stage adoption file for: $rel"
+  render_adopt_file "$rel" "$adopt_temp_path"
+  if ln "$adopt_temp_path" "$path" 2>/dev/null; then
+    rm -f "$adopt_temp_path"
+  else
+    rm -f "$adopt_temp_path"
+    [[ -e "$path" || -L "$path" ]] || die "could not create file: $path"
+    printf 'Skipped (appeared concurrently): %s\n' "$rel"
+  fi
+  adopt_temp_path=""
+}
+
+if [[ $# -eq 0 ]]; then
+  usage >&2
+  exit 2
+fi
+
+case "$1" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  --version)
+    version_file="$(cd "$(resolve_script_dir)/.." && pwd)/VERSION"
+    [[ -f "$version_file" ]] || die "missing version marker: $version_file"
+    cat "$version_file"
+    exit 0
+    ;;
+  init|adopt)
+    command_name="$1"
+    shift
+    ;;
+  *)
+    die "unknown command: $1"
+    ;;
+esac
+
+if [[ $# -eq 0 ]]; then
+  die "$command_name requires a target path"
+fi
+
+case "$1" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  -*)
+    die "$command_name requires a target path before options"
+    ;;
+esac
+
+target_path="$1"
+shift
+purpose=""
+dry_run=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --purpose)
+      [[ $# -ge 2 ]] || die "--purpose requires text"
+      purpose="$2"
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown option: $1"
+      ;;
+  esac
+done
+
+[[ -n "$target_path" ]] || die "target path cannot be empty"
+if [[ "$purpose" == *$'\n'* || "$purpose" == *$'\r'* ]]; then
+  die "--purpose must be one line"
+fi
+
+if [[ "$command_name" == "adopt" ]]; then
+  [[ ! -L "$target_path" ]] || die "target cannot be a symlink: $target_path"
+  [[ -e "$target_path" ]] ||
+    die "adopt requires an existing directory (use init for a new project): $target_path"
+  [[ -d "$target_path" ]] ||
+    die "target exists and is not a directory: $target_path"
+  target_path="$(cd "$target_path" && pwd -P)"
+  project_name="$(basename "$target_path")"
+elif [[ -e "$target_path" || -L "$target_path" ]]; then
+  [[ ! -L "$target_path" ]] || die "target cannot be a symlink: $target_path"
+  [[ -d "$target_path" ]] || die "target exists and is not a directory: $target_path"
+  target_is_empty_directory "$target_path" ||
+    die "target directory is not empty: $target_path"
+  target_path="$(cd "$target_path" && pwd -P)"
+  project_name="$(basename "$target_path")"
+  target_parent="$(dirname "$target_path")"
+else
+  while [[ "$target_path" == ./* ]]; do
+    target_path="${target_path#./}"
+  done
+  [[ -n "$target_path" && "$target_path" != "/" ]] ||
+    die "target path cannot be the filesystem root"
+  path_segments="/$target_path/"
+  if [[ "$path_segments" == *"/../"* || "$path_segments" == *"/./"* ]]; then
+    die "target path cannot contain '.' or '..' segments: $target_path"
+  fi
+  project_name="$(basename "$target_path")"
+  [[ "$project_name" != "." && "$project_name" != ".." ]] ||
+    die "target path must name a project directory"
+  target_parent="$(dirname "$target_path")"
+fi
+
+script_dir="$(resolve_script_dir)"
+repo_root="$(cd "$script_dir/.." && pwd)"
+template_dir="$repo_root/templates/project"
+readme_template="$template_dir/README.md.tmpl"
+agents_template="$template_dir/AGENTS.md"
+claude_template="$template_dir/CLAUDE.md"
+gemini_template="$template_dir/GEMINI.md"
+gitignore_template="$template_dir/gitignore"
+
+[[ -f "$readme_template" ]] || die "missing template: $readme_template"
+[[ -f "$agents_template" ]] || die "missing template: $agents_template"
+[[ -f "$claude_template" ]] || die "missing template: $claude_template"
+[[ -f "$gemini_template" ]] || die "missing template: $gemini_template"
+[[ -f "$gitignore_template" ]] || die "missing template: $gitignore_template"
+
+if [[ "$command_name" == "init" ]]; then
+  command -v git >/dev/null 2>&1 ||
+    die "Git is required to initialize an independent repository"
+fi
+
+if [[ -z "$purpose" ]]; then
+  purpose="TODO: Describe this project in one sentence."
+fi
+
+if [[ "$command_name" == "adopt" ]]; then
+  starter_version="$(read_starter_version)"
+  trap cleanup_adopt EXIT
+
+  for envelope_dir in docs planning handoffs scripts swarms temp .agent; do
+    classify_directory "$envelope_dir"
+  done
+  for durable_dir in docs planning handoffs scripts swarms; do
+    classify_gitkeep "$durable_dir"
+  done
+  for envelope_file in README.md AGENTS.md CLAUDE.md GEMINI.md .gitignore \
+    .andx-starter; do
+    classify_file "$envelope_file"
+  done
+
+  printf 'Adoption plan for %s:\n' "$target_path"
+  index=0
+  while [[ "$index" -lt "$plan_action_count" ]]; do
+    printf '  %s\n' "${plan_actions[$index]}"
+    index=$((index + 1))
+  done
+  if [[ "$conflict_count" -gt 0 ]]; then
+    printf '\nConflicts requiring manual resolution:\n'
+    index=0
+    while [[ "$index" -lt "$conflict_count" ]]; do
+      printf '  %s\n' "${conflict_reports[$index]}"
+      index=$((index + 1))
+    done
+  fi
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    printf '\nDry run: no changes made.\n'
+    [[ "$conflict_count" -eq 0 ]] || exit 3
+    exit 0
+  fi
+
+  index=0
+  while [[ "$index" -lt "$create_count" ]]; do
+    adopt_create_path "${create_list[$index]}"
+    index=$((index + 1))
+  done
+
+  printf '\nAdopted project envelope at %s.\n' "$target_path"
+  if [[ "$conflict_count" -gt 0 ]]; then
+    printf 'Resolve the listed conflicts manually; nothing was overwritten.\n'
+    exit 3
+  fi
+  printf 'Next: review the created files and commit them under repository policy.\n'
+  exit 0
+fi
+
+if [[ "$dry_run" -eq 1 ]]; then
+  printf 'Would create project at %s:\n' "$target_path"
+  print_tree
+  exit 0
+fi
+
+mkdir -p "$target_parent"
+target_parent="$(cd "$target_parent" && pwd -P)"
+target_path="$target_parent/$project_name"
+
+if [[ -e "$target_path" || -L "$target_path" ]]; then
+  [[ ! -L "$target_path" ]] || die "target changed into a symlink: $target_path"
+  [[ -d "$target_path" ]] || die "target changed and is not a directory: $target_path"
+  target_is_empty_directory "$target_path" ||
+    die "target changed and is no longer empty: $target_path"
+fi
+
+stage_path="$(mktemp -d "$target_parent/.${project_name}.andx-init.XXXXXX")"
+cleanup_stage() {
+  if [[ -n "${stage_path:-}" && -d "$stage_path" ]]; then
+    rm -rf "$stage_path"
+  fi
+}
+trap cleanup_stage EXIT
+
+mkdir -p \
+  "$stage_path/docs" \
+  "$stage_path/planning" \
+  "$stage_path/handoffs" \
+  "$stage_path/scripts" \
+  "$stage_path/swarms" \
+  "$stage_path/temp" \
+  "$stage_path/.agent"
+
+for durable_dir in docs planning handoffs scripts swarms; do
+  : > "$stage_path/$durable_dir/.gitkeep"
+done
+
+render_readme \
+  "$readme_template" \
+  "$stage_path/README.md" \
+  "$project_name" \
+  "$purpose"
+cp "$agents_template" "$stage_path/AGENTS.md"
+cp "$claude_template" "$stage_path/CLAUDE.md"
+cp "$gemini_template" "$stage_path/GEMINI.md"
+cp "$gitignore_template" "$stage_path/.gitignore"
+printf 'starter_version=%s\n' "$(read_starter_version)" > \
+  "$stage_path/.andx-starter"
+
+if [[ -d "$target_path" ]]; then
+  rmdir "$target_path" ||
+    die "target changed and could not be replaced safely: $target_path"
+fi
+
+if ! mkdir "$target_path"; then
+  die "target appeared during initialization: $target_path"
+fi
+
+(
+  cd -P "$target_path" ||
+    die "could not enter claimed target: $target_path"
+  [[ ! -L "$target_path" && "$target_path" -ef . ]] ||
+    die "target changed after it was claimed: $target_path"
+  : > .andx-init-claim
+
+  if ! cp -R "$stage_path/." .; then
+    die "could not populate target; target was left in place for inspection: $target_path"
+  fi
+  [[ ! -L "$target_path" && "$target_path" -ef . && -f .andx-init-claim ]] ||
+    die "target changed during initialization; target was left in place: $target_path"
+  [[ ! -e .git && ! -L .git ]] ||
+    die "Git metadata appeared during initialization; target was left in place: $target_path"
+  if ! env \
+    -u GIT_DIR \
+    -u GIT_WORK_TREE \
+    -u GIT_COMMON_DIR \
+    -u GIT_INDEX_FILE \
+    -u GIT_OBJECT_DIRECTORY \
+    -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+    git init -q .; then
+    die "could not initialize independent Git repository; target was left in place: $target_path"
+  fi
+  [[ -d .git && ! -L .git ]] ||
+    die "Git did not create repository metadata inside the target: $target_path"
+  initialized_root="$(
+    env \
+      -u GIT_DIR \
+      -u GIT_WORK_TREE \
+      -u GIT_COMMON_DIR \
+      -u GIT_INDEX_FILE \
+      -u GIT_OBJECT_DIRECTORY \
+      -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+      git rev-parse --show-toplevel
+  )"
+  [[ "$initialized_root" == "$(pwd -P)" ]] ||
+    die "Git repository boundary does not match the target: $target_path"
+  rm -f .andx-init-claim
+)
+
+printf 'Created project at %s:\n' "$target_path"
+print_tree
+printf '\nInitialized an independent local Git repository with no remote.\n'
+printf 'Next: review and commit the generated files. Replace the Start and Verify placeholders when the first executable path exists.\n'

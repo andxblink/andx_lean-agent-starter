@@ -1,0 +1,35 @@
+{{PROJECT_TITLE}}
+
+{{PROJECT_PURPOSE}}
+
+## Start
+
+No runtime has been selected. Add the shortest truthful start command when the
+project gains an executable path.
+
+## Verify
+
+No project-specific check exists yet. Add the canonical check with the first
+useful behavior.
+
+## Agent contract
+
+`AGENTS.md` is the canonical operating contract. `CLAUDE.md` and `GEMINI.md`
+only direct their agents to it through vendor-specific discovery filenames.
+Keep shared rules in `AGENTS.md` rather than duplicating them in adapters or
+this README.
+
+## Directory contract
+
+| Directory | What belongs there |
+| --- | --- |
+| `docs/` | Current durable project knowledge |
+| `planning/` | Forward plans only when coordination, risk, or duration justifies one |
+| `handoffs/` | State crossing a real session, agent, model, operator, repository, or workspace boundary |
+| `scripts/` | Stable, narrow operations with explicit inputs and bounded effects |
+| `swarms/` | Optional multi-agent task manifests and executable checks |
+| `temp/` | Disposable scratch files and worktrees; never commit |
+| `.agent/` | Live continuity and replaceable agent state; never commit |
+
+Application directories and project-specific rules should develop from the
+project's actual needs.
